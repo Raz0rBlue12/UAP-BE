@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+python-dotenv
+supabase
+asyncpg
+pydantic
+email-validator
+PyJWT
+passlib[bcrypt]
+python-multipart
+cloudinary
+aiofiles
+python-magic
+python-magic-bin
+bcrypt
+jinja2
+aiosmtplib

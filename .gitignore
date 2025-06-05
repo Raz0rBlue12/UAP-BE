@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+
+# Virtual Environment
+env/
+venv/
+ENV/
+.venv/
+.env/
+
+# VSCode
+.vscode/
+
+# Pytest
+.cache/
+*.pytest_cache/
+
+# Byte-compiled / optimized / DLL files
+*.so
+
+# SQLite (if used temporarily)
+*.db
+
+# Logs
+*.log
+
+# Alembic (optional migrations)
+alembic/versions/
+
+# MyPy
+.mypy_cache/
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# Pydantic cache
+__pydantic_model__.json
+
+#ENV JANGAN DIPUSH YAAA
+.env
