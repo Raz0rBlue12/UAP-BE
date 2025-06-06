@@ -9,4 +9,4 @@ class UserProfile(BaseModel):
     profile_pic: Optional[str]
 
     class Config:
-        orm_mode = True
+        from_attributes = True

@@ -7,7 +7,7 @@ class Wishlist(BaseModel):
     product_id: int
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class WishlistItemBase(BaseModel):
     product_id: int = Field(..., description="ID of the product to add to wishlist")

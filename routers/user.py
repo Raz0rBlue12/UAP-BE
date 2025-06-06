@@ -7,8 +7,9 @@ import tempfile
 import magic  # for file type validation
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import re
+from pydantic import BaseModel
 
-from models.user import UserOut, UserProfile
+from models.user import UserOut, UserProfile, UserProfileUpdate, UserProfileOut
 from routers.auth import get_current_user
 from db.client import get_pg_connection
 from config.cloudinary_config import upload_image, delete_image
@@ -64,516 +65,415 @@ def check_rate_limit(request: Request) -> bool:
     
     return True
 
-@router.get("/", response_model=List[UserOut])
+@router.get("", response_model=List[UserOut])
 async def get_users(
-    request: Request,
-    skip: int = 0,
-    limit: int = 10,
-    current_user = Depends(get_current_user)
+    current_user: UserOut = Depends(get_current_user)
 ):
     """Get all users (admin only)"""
-    # Rate limiting
-    if not check_rate_limit(request):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many requests"
-        )
-    
-    # Input validation
-    if skip < 0 or limit < 1 or limit > 100:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid pagination parameters"
-        )
-    
-    if current_user["role"] != "admin":
+    if current_user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to view all users"
+            detail="Only admins can view all users"
         )
     
-    conn = await get_pg_connection()
+    pool = await get_pg_connection()
     try:
-        users = await conn.fetch(
-            """
-            SELECT user_id, username, email, role, created_at
-            FROM users
-            ORDER BY created_at DESC
-            LIMIT $1 OFFSET $2
-            """,
-            limit, skip
+        async with pool.acquire() as conn:
+            users = await conn.fetch(
+                """
+                SELECT user_id, username, email, role, created_at, is_active
+                FROM users
+                ORDER BY created_at DESC
+                """
+            )
+            return [dict(user) for user in users]
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
         )
-        return [dict(user) for user in users]
     finally:
-        await conn.close()
+        await pool.close()
 
 @router.get("/{user_id}", response_model=UserOut)
 async def get_user(
-    request: Request,
     user_id: int,
-    current_user = Depends(get_current_user)
+    current_user: UserOut = Depends(get_current_user)
 ):
     """Get user by ID"""
-    # Rate limiting
-    if not check_rate_limit(request):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many requests"
-        )
-    
-    # Input validation
-    if user_id < 1:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid user ID"
-        )
-    
-    if current_user["role"] != "admin" and current_user["user_id"] != user_id:
+    if current_user.role != "admin" and current_user.user_id != user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to view this user"
+            detail="Not authorized to access this user"
         )
     
-    conn = await get_pg_connection()
+    pool = await get_pg_connection()
     try:
-        user = await conn.fetchrow(
-            """
-            SELECT user_id, username, email, role, created_at
-            FROM users
-            WHERE user_id = $1
-            """,
-            user_id
-        )
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
+        async with pool.acquire() as conn:
+            user = await conn.fetchrow(
+                "SELECT * FROM users WHERE user_id = $1",
+                user_id
             )
-        return dict(user)
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User not found"
+                )
+            return dict(user)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
     finally:
-        await conn.close()
+        await pool.close()
 
-@router.get("/{user_id}/profile", response_model=UserProfile)
+@router.get("/{user_id}/profile", response_model=UserProfileOut)
 async def get_user_profile(
     user_id: int,
-    current_user = Depends(get_current_user)
+    current_user: UserOut = Depends(get_current_user)
 ):
-    """Get user profile"""
-    # Users can only view their own profile unless they're admin
-    if current_user["role"] != "admin" and current_user["user_id"] != user_id:
+    """Get user profile by user ID"""
+    if current_user.role != "admin" and current_user.user_id != user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to view this profile"
+            detail="Not authorized to access this profile"
         )
     
-    conn = await get_pg_connection()
+    pool = await get_pg_connection()
     try:
-        profile = await conn.fetchrow(
-            """
-            SELECT profile_id, user_id, full_name, bio, profile_pic
-            FROM user_profiles
-            WHERE user_id = $1
-            """,
-            user_id
-        )
-        if not profile:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Profile not found"
+        async with pool.acquire() as conn:
+            profile = await conn.fetchrow(
+                "SELECT * FROM user_profiles WHERE user_id = $1",
+                user_id
             )
-        return dict(profile)
+            if not profile:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Profile not found"
+                )
+            return dict(profile)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
     finally:
-        await conn.close()
+        await pool.close()
 
-@router.put("/{user_id}/profile", response_model=UserProfile)
+@router.put("/{user_id}/profile", response_model=UserProfileOut)
 async def update_user_profile(
     user_id: int,
-    profile: UserProfile,
-    current_user = Depends(get_current_user)
+    profile_update: UserProfileUpdate,
+    current_user: UserOut = Depends(get_current_user)
 ):
     """Update user profile"""
-    # Users can only update their own profile unless they're admin
-    if current_user["role"] != "admin" and current_user["user_id"] != user_id:
+    if current_user.user_id != user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not authorized to update this profile"
         )
     
-    conn = await get_pg_connection()
+    pool = await get_pg_connection()
     try:
-        async with conn.transaction():
+        async with pool.acquire() as conn:
             # Check if profile exists
-            existing_profile = await conn.fetchrow(
-                "SELECT profile_id FROM user_profiles WHERE user_id = $1",
-                user_id
-            )
-            
-            if existing_profile:
-                # Update existing profile
-                updated_profile = await conn.fetchrow(
-                    """
-                    UPDATE user_profiles
-                    SET full_name = $1, bio = $2, profile_pic = $3
-                    WHERE user_id = $4
-                    RETURNING profile_id, user_id, full_name, bio, profile_pic
-                    """,
-                    profile.full_name, profile.bio, profile.profile_pic, user_id
-                )
-            else:
-                # Create new profile
-                updated_profile = await conn.fetchrow(
-                    """
-                    INSERT INTO user_profiles (user_id, full_name, bio, profile_pic)
-                    VALUES ($1, $2, $3, $4)
-                    RETURNING profile_id, user_id, full_name, bio, profile_pic
-                    """,
-                    user_id, profile.full_name, profile.bio, profile.profile_pic
-                )
-            
-            return dict(updated_profile)
-    finally:
-        await conn.close()
-
-@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_user(
-    request: Request,
-    user_id: int,
-    current_user = Depends(get_current_user)
-):
-    """Delete user (admin only)"""
-    # Rate limiting
-    if not check_rate_limit(request):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many requests"
-        )
-
-    # Input validation
-    if user_id < 1:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid user ID"
-        )
-
-    # Authorization: Only admin can delete users, and cannot delete themselves
-    if current_user["role"] != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to delete users"
-        )
-    if current_user["user_id"] == user_id:
-         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot delete your own account"
-        )
-
-    conn = await get_pg_connection()
-    try:
-        async with conn.transaction():
-            # Check if user exists
-            existing_user = await conn.fetchrow(
-                "SELECT user_id FROM users WHERE user_id = $1",
-                user_id
-            )
-            if not existing_user:
-                 raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User not found"
-                )
-
-            # Delete user (ON DELETE CASCADE handles related data like profile, cart, wishlist, etc.)
-            result = await conn.execute(
-                "DELETE FROM users WHERE user_id = $1",
-                user_id
-            )
-
-            if result != "DELETE 1":
-                 raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to delete user"
-                )
-
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
-    finally:
-        await conn.close()
-
-@router.put("/{user_id}/role", response_model=UserOut)
-async def update_user_role(
-    request: Request,
-    user_id: int,
-    new_role: Literal["customer", "seller", "admin"],
-    current_user = Depends(get_current_user)
-):
-    """Update user role (admin only)"""
-    # Rate limiting
-    if not check_rate_limit(request):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many requests"
-        )
-
-    # Input validation
-    if user_id < 1:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid user ID"
-        )
-
-    # Authorization: Only admin can update roles, and cannot change their own role
-    if current_user["role"] != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to update user roles"
-        )
-    if current_user["user_id"] == user_id:
-         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot change your own role"
-        )
-
-    conn = await get_pg_connection()
-    try:
-        async with conn.transaction():
-            # Check if user exists
-            existing_user = await conn.fetchrow(
-                "SELECT user_id FROM users WHERE user_id = $1",
-                user_id
-            )
-            if not existing_user:
-                 raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User not found"
-                )
-
-            # Update the user's role
-            updated_user = await conn.fetchrow(
-                """
-                UPDATE users
-                SET role = $1
-                WHERE user_id = $2
-                RETURNING user_id, username, email, role, created_at, is_active
-                """,
-                new_role,
-                user_id
-            )
-
-            if not updated_user:
-                 raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to update user role"
-                )
-
-            # Note: Assuming UserOut model includes is_active after db migration
-            return dict(updated_user)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
-    finally:
-        await conn.close()
-
-@router.put("/{user_id}/status", response_model=UserOut)
-async def update_user_status(
-    request: Request,
-    user_id: int,
-    is_active: bool = Query(..., description="Set user active status (true/false)"),
-    current_user = Depends(get_current_user)
-):
-    """Activate or deactivate user (admin only)"""
-    # Rate limiting
-    if not check_rate_limit(request):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many requests"
-        )
-
-    # Input validation
-    if user_id < 1:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid user ID"
-        )
-
-    # Authorization: Only admin can update status, and cannot change their own status
-    if current_user["role"] != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to update user status"
-        )
-    if current_user["user_id"] == user_id and not is_active:
-         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot deactivate your own account"
-        )
-
-    conn = await get_pg_connection()
-    try:
-        async with conn.transaction():
-            # Check if user exists
-            existing_user = await conn.fetchrow(
-                "SELECT user_id FROM users WHERE user_id = $1",
-                user_id
-            )
-            if not existing_user:
-                 raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User not found"
-                )
-
-            # Update the user's active status
-            updated_user = await conn.fetchrow(
-                """
-                UPDATE users
-                SET is_active = $1
-                WHERE user_id = $2
-                RETURNING user_id, username, email, role, created_at, is_active
-                """,
-                is_active,
-                user_id
-            )
-
-            if not updated_user:
-                 raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to update user status"
-                )
-
-            # Note: Assuming UserOut model includes is_active after db migration
-            return dict(updated_user)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
-    finally:
-        await conn.close()
-
-@router.post("/{user_id}/profile/upload", response_model=UserProfile)
-async def upload_profile_picture(
-    request: Request,
-    user_id: int,
-    file: UploadFile = File(...),
-    current_user = Depends(get_current_user)
-):
-    """Upload profile picture"""
-    # Rate limiting
-    if not check_rate_limit(request):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many requests"
-        )
-    
-    # Input validation
-    if user_id < 1:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid user ID"
-        )
-    
-    if not validate_filename(file.filename):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid filename"
-        )
-    
-    # Authorization check
-    if current_user["role"] != "admin" and current_user["user_id"] != user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to upload profile picture"
-        )
-    
-    # File validation
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File too large"
-        )
-    
-    # Check file type using python-magic
-    file_type = magic.from_buffer(content, mime=True)
-    if file_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid file type"
-        )
-    
-    conn = await get_pg_connection()
-    try:
-        async with conn.transaction():
-            # Get current profile
             profile = await conn.fetchrow(
                 "SELECT * FROM user_profiles WHERE user_id = $1",
                 user_id
             )
             
-            # Save file temporarily with secure permissions
-            temp_fd, temp_path = tempfile.mkstemp(suffix=ALLOWED_IMAGE_TYPES[file_type])
-            try:
-                with os.fdopen(temp_fd, 'wb') as temp_file:
-                    temp_file.write(content)
-                os.chmod(temp_path, 0o600)  # Secure file permissions
-                
-                # Upload to Cloudinary
-                upload_result = upload_image(
-                    temp_path,
-                    folder="profiles",
-                    resource_type="image"
+            if profile:
+                # Update existing profile
+                updated_profile = await conn.fetchrow(
+                    """
+                    UPDATE user_profiles 
+                    SET 
+                        full_name = COALESCE($1, full_name),
+                        phone_number = COALESCE($2, phone_number),
+                        address = COALESCE($3, address),
+                        city = COALESCE($4, city),
+                        postal_code = COALESCE($5, postal_code),
+                        bio = COALESCE($6, bio),
+                        profile_pic = COALESCE($7, profile_pic),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = $8
+                    RETURNING *
+                    """,
+                    profile_update.full_name,
+                    profile_update.phone_number,
+                    profile_update.address,
+                    profile_update.city,
+                    profile_update.postal_code,
+                    profile_update.bio,
+                    profile_update.profile_pic,
+                    user_id
                 )
-                
-                # If there's an existing profile picture, delete it from Cloudinary
-                if profile and profile["profile_pic"]:
-                    try:
-                        public_id = profile["profile_pic"].split("/")[-1].split(".")[0]
-                        delete_image(public_id)
-                    except Exception as e:
-                        print(f"Error deleting old profile picture: {str(e)}")
-                
-                # Update or create profile
-                if profile:
-                    updated_profile = await conn.fetchrow(
-                        """
-                        UPDATE user_profiles
-                        SET profile_pic = $1
-                        WHERE user_id = $2
-                        RETURNING profile_id, user_id, full_name, bio, profile_pic
-                        """,
-                        upload_result["url"], user_id
-                    )
-                else:
-                    updated_profile = await conn.fetchrow(
-                        """
-                        INSERT INTO user_profiles (user_id, profile_pic)
-                        VALUES ($1, $2)
-                        RETURNING profile_id, user_id, full_name, bio, profile_pic
-                        """,
-                        user_id, upload_result["url"]
-                    )
-                
-                return dict(updated_profile)
+            else:
+                # Create new profile
+                updated_profile = await conn.fetchrow(
+                    """
+                    INSERT INTO user_profiles 
+                    (user_id, full_name, phone_number, address, city, postal_code, bio, profile_pic)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING *
+                    """,
+                    user_id,
+                    profile_update.full_name,
+                    profile_update.phone_number,
+                    profile_update.address,
+                    profile_update.city,
+                    profile_update.postal_code,
+                    profile_update.bio,
+                    profile_update.profile_pic
+                )
             
-            finally:
-                # Secure cleanup of temporary file
-                try:
-                    os.unlink(temp_path)
-                except Exception as e:
-                    print(f"Error deleting temporary file: {str(e)}")
-    
+            return dict(updated_profile)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
     finally:
-        await conn.close() 
+        await pool.close()
+
+@router.delete("/{user_id}")
+async def delete_user(
+    user_id: int,
+    current_user: UserOut = Depends(get_current_user)
+):
+    """Delete a user (admin only)"""
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can delete users"
+        )
+    
+    pool = await get_pg_connection()
+    try:
+        async with pool.acquire() as conn:
+            # Check if user exists
+            user = await conn.fetchrow(
+                "SELECT * FROM users WHERE user_id = $1",
+                user_id
+            )
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User not found"
+                )
+            
+            # Prevent deleting the last admin
+            if user["role"] == "admin":
+                admin_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = true"
+                )
+                if admin_count <= 1:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Cannot delete the last active admin"
+                    )
+            
+            # Delete user
+            await conn.execute(
+                "DELETE FROM users WHERE user_id = $1",
+                user_id
+            )
+            return {"message": "User deleted successfully"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+    finally:
+        await pool.close()
+
+class UserRoleUpdate(BaseModel):
+    role: str
+
+class UserStatusUpdate(BaseModel):
+    is_active: bool
+
+@router.put("/{user_id}/role", response_model=UserOut)
+async def update_user_role(
+    user_id: int,
+    role_update: UserRoleUpdate,
+    current_user: UserOut = Depends(get_current_user)
+):
+    """Update user role (admin only)"""
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can update user roles"
+        )
+    
+    # Validate role
+    if role_update.role not in ["customer", "seller", "admin"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid role. Must be one of: customer, seller, admin"
+        )
+    
+    pool = await get_pg_connection()
+    try:
+        async with pool.acquire() as conn:
+            # Check if user exists
+            user = await conn.fetchrow(
+                "SELECT * FROM users WHERE user_id = $1",
+                user_id
+            )
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User not found"
+                )
+            
+            # Update user role
+            updated_user = await conn.fetchrow(
+                """
+                UPDATE users 
+                SET role = $1
+                WHERE user_id = $2
+                RETURNING user_id, username, email, role, created_at, is_active
+                """,
+                role_update.role, user_id
+            )
+            return dict(updated_user)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+    finally:
+        await pool.close()
+
+@router.put("/{user_id}/status", response_model=UserOut)
+async def update_user_status(
+    user_id: int,
+    status_update: UserStatusUpdate,
+    current_user: UserOut = Depends(get_current_user)
+):
+    """Update user status (admin only)"""
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can update user status"
+        )
+    
+    pool = await get_pg_connection()
+    try:
+        async with pool.acquire() as conn:
+            # Check if user exists
+            user = await conn.fetchrow(
+                "SELECT * FROM users WHERE user_id = $1",
+                user_id
+            )
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User not found"
+                )
+            
+            # Prevent deactivating the last admin
+            if not status_update.is_active and user["role"] == "admin":
+                admin_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = true"
+                )
+                if admin_count <= 1:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Cannot deactivate the last active admin"
+                    )
+            
+            # Update user status
+            updated_user = await conn.fetchrow(
+                """
+                UPDATE users 
+                SET is_active = $1
+                WHERE user_id = $2
+                RETURNING user_id, username, email, role, created_at, is_active
+                """,
+                status_update.is_active, user_id
+            )
+            return dict(updated_user)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+    finally:
+        await pool.close()
+
+@router.post("/{user_id}/profile/upload", response_model=UserProfileOut)
+async def upload_profile_picture(
+    user_id: int,
+    file: UploadFile = File(...),
+    current_user: UserOut = Depends(get_current_user)
+):
+    """Upload profile picture"""
+    if current_user.role != "admin" and current_user.user_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to update this profile"
+        )
+    
+    # Validate file type
+    if not file.content_type.startswith('image/'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File must be an image"
+        )
+    
+    # Validate file size (max 5MB)
+    file_size = 0
+    chunk_size = 1024 * 1024  # 1MB chunks
+    while chunk := await file.read(chunk_size):
+        file_size += len(chunk)
+        if file_size > 5 * 1024 * 1024:  # 5MB
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="File size must be less than 5MB"
+            )
+    
+    # Reset file pointer
+    await file.seek(0)
+    
+    try:
+        # Upload to Cloudinary
+        upload_result = upload_image(file.file, "profile_pictures")
+        
+        # Get the image URL from the upload result
+        image_url = upload_result.get("url") or upload_result.get("secure_url")
+        if not image_url:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to get image URL from upload result"
+            )
+        
+        # Update profile in database
+        pool = await get_pg_connection()
+        try:
+            async with pool.acquire() as conn:
+                updated_profile = await conn.fetchrow(
+                    """
+                    UPDATE user_profiles 
+                    SET profile_pic = $1, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = $2
+                    RETURNING *
+                    """,
+                    image_url,
+                    user_id
+                )
+                if not updated_profile:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Profile not found"
+                    )
+                return dict(updated_profile)
+        finally:
+            await pool.close()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        ) 

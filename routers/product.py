@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from typing import List, Optional, Literal
 from db.client import get_pg_connection
 from models.product import ProductCreate, ProductOut, ProductUpdate, ProductImage
+from models.user import UserOut
 from routers.auth import get_current_user, require_role
 from fastapi import Security
 from config.cloudinary_config import upload_image, delete_image
@@ -10,6 +11,8 @@ import os
 import tempfile
 import magic # for file type validation
 import re
+from pydantic import BaseModel
+import cloudinary
 
 router = APIRouter(
     prefix="/products",
@@ -49,43 +52,30 @@ async def fetch_product_with_images(conn, product_id: int):
     product_dict['images'] = [dict(img) for img in images]
     return ProductOut(**product_dict)
 
-@router.post("/", response_model=ProductOut, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=ProductOut)
 async def create_product(
     product: ProductCreate,
-    current_user = Depends(require_role(["seller", "admin"]))
+    current_user: UserOut = Depends(require_role(["seller", "admin"]))
 ):
-    """Create a new product (Seller/Admin only)"""
+    """Create a new product (seller only)"""
     pool = await get_pg_connection()
     try:
         async with pool.acquire() as conn:
-            async with conn.transaction():
-                # Determine initial status based on user role
-                initial_status = "approved" if current_user['role'] == 'admin' else "pending"
-
-                new_product = await conn.fetchrow(
-                    """
-                    INSERT INTO products (seller_id, name, description, price, stock, category, status)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    RETURNING product_id, seller_id, name, description, price, stock, category, rating, created_at, status
-                    """,
-                    current_user['user_id'],
-                    product.name,
-                    product.description,
-                    product.price,
-                    product.stock,
-                    product.category,
-                    initial_status
-                )
-
-                if not new_product:
-                     raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="Failed to create product"
-                    )
-
-                # Fetch the newly created product with images (should be empty initially)
-                product_out = await fetch_product_with_images(conn, new_product['product_id'])
-                return product_out
+            # Determine initial status based on user role
+            initial_status = "approved" if current_user.role == "admin" else "pending"
+            
+            # Create product
+            new_product = await conn.fetchrow(
+                """
+                INSERT INTO products (
+                    seller_id, name, description, price, stock, category, status
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING *
+                """,
+                current_user.user_id, product.name, product.description,
+                product.price, product.stock, product.category, initial_status
+            )
+            return dict(new_product)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -94,109 +84,126 @@ async def create_product(
     finally:
         await pool.close()
 
-@router.get("/", response_model=List[ProductOut])
-async def read_products(
-    search: Optional[str] = Query(None, description="Search product by name or description"),
-    category: Optional[str] = Query(None, description="Filter by category"),
-    min_price: Optional[float] = Query(None, description="Filter by minimum price", ge=0),
-    max_price: Optional[float] = Query(None, description="Filter by maximum price", ge=0),
-    min_rating: Optional[float] = Query(None, description="Filter by minimum rating", ge=0, le=5),
-    max_rating: Optional[float] = Query(None, description="Filter by maximum rating", ge=0, le=5),
-    sort_by: Optional[str] = Query("product_id", description="Field to sort by (e.g., price, rating, created_at, name)"),
-    sort_order: Optional[str] = Query("asc", description="Sort order (asc or desc)"),
-    page: int = Query(1, description="Page number", ge=1),
-    limit: int = Query(10, description="Items per page", ge=1, le=100),
-    current_user = Depends(get_current_user) # Inject current user
+@router.get("", response_model=List[ProductOut])
+async def get_products(
+    skip: int = 0,
+    limit: int = 10,
+    category: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    current_user: Optional[UserOut] = Depends(get_current_user)
 ):
-    """Get all products with optional search, filter, sorting, and pagination"""
+    """Get all products with optional filters"""
     pool = await get_pg_connection()
     try:
         async with pool.acquire() as conn:
-            # Base query
-            query = "SELECT * FROM products"
-            where_clauses = []
-            query_params = []
-            param_index = 1
+            # Build query with filters
+            query = """
+                SELECT 
+                    p.*,
+                    COALESCE(
+                        json_agg(
+                            json_build_object(
+                                'image_id', pi.image_id,
+                                'image_url', pi.image_url,
+                                'uploaded_at', pi.uploaded_at
+                            )
+                        ) FILTER (WHERE pi.image_id IS NOT NULL),
+                        '[]'::json
+                    ) as images
+                FROM products p
+                LEFT JOIN product_images pi ON p.product_id = pi.product_id
+                WHERE p.status = 'approved'
+            """
+            params = []
+            param_count = 1
 
-            # Filter by status: only show approved products unless user is admin
-            if current_user['role'] != 'admin':
-                where_clauses.append(f"status = ${param_index}")
-                query_params.append("approved")
-                param_index += 1
-            else:
-                 # Optional: Admin can filter by status using query parameter if needed
-                 # status_filter: Optional[Literal['pending', 'approved', 'rejected']] = Query(None)
-                 # if status_filter:
-                 #    where_clauses.append(f"status = ${param_index}")
-                 #    query_params.append(status_filter)
-                 #    param_index += 1
-                 pass # Admin sees all statuses by default
-
-
-            # Add search conditions
-            if search:
-                where_clauses.append(f"(name ILIKE ${param_index} OR description ILIKE ${param_index})")
-                query_params.append(f"%{search}%")
-                param_index += 1
-
-            # Add filter conditions
             if category:
-                where_clauses.append(f"category = ${param_index}")
-                query_params.append(category)
-                param_index += 1
+                query += f" AND p.category = ${param_count}"
+                params.append(category)
+                param_count += 1
+
             if min_price is not None:
-                where_clauses.append(f"price >= ${param_index}")
-                query_params.append(min_price)
-                param_index += 1
+                query += f" AND p.price >= ${param_count}"
+                params.append(min_price)
+                param_count += 1
+
             if max_price is not None:
-                where_clauses.append(f"price <= ${param_index}")
-                query_params.append(max_price)
-                param_index += 1
-            if min_rating is not None:
-                where_clauses.append(f"rating >= ${param_index}")
-                query_params.append(min_rating)
-                param_index += 1
-            if max_rating is not None:
-                where_clauses.append(f"rating <= ${param_index}")
-                query_params.append(max_rating)
-                param_index += 1
+                query += f" AND p.price <= ${param_count}"
+                params.append(max_price)
+                param_count += 1
 
-            # Combine where clauses
-            if where_clauses:
-                query += " WHERE " + " AND ".join(where_clauses)
+            query += " GROUP BY p.product_id"
+            query += f" ORDER BY p.created_at DESC LIMIT ${param_count} OFFSET ${param_count + 1}"
+            params.extend([limit, skip])
 
-            # Add sorting
-            valid_sort_fields = ["product_id", "name", "price", "stock", "rating", "created_at"]
-            if sort_by and sort_by.lower() in valid_sort_fields:
-                sort_order_upper = sort_order.upper() if sort_order else "ASC"
-                query += f" ORDER BY {sort_by} {sort_order_upper}"
-            else:
-                # Default sorting if invalid field is provided
-                 query += f" ORDER BY product_id ASC"
-
-
-            # Add pagination
-            offset = (page - 1) * limit
-            query += f" LIMIT ${param_index} OFFSET ${param_index + 1}"
-            query_params.append(limit)
-            query_params.append(offset)
-            param_index += 2 # Increment param_index for limit and offset
-
-
-            products_data = await conn.fetch(query, *query_params)
-
-            products_out = []
-            for product in products_data:
-                products_out.append(await fetch_product_with_images(conn, product['product_id']))
-
-            # TODO: Add total count for pagination metadata if needed
-            # count_query = "SELECT COUNT(*) FROM products"
-            # if where_clauses:
-            #     count_query += " WHERE " + " AND ".join(where_clauses)
-            # total_count = await conn.fetchval(count_query, *query_params[:-2]) # Exclude limit and offset params
-            # return {"total": total_count, "page": page, "limit": limit, "items": products_out}
+            products = await conn.fetch(query, *params)
             
-            return products_out
+            # Convert records to dictionaries and parse images
+            result = []
+            for product in products:
+                product_dict = dict(product)
+                if isinstance(product_dict['images'], str):
+                    import json
+                    product_dict['images'] = json.loads(product_dict['images'])
+                result.append(product_dict)
+            
+            return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+    finally:
+        await pool.close()
+
+@router.get("/seller", response_model=List[ProductOut])
+async def get_seller_products(
+    current_user: UserOut = Depends(get_current_user)
+):
+    """Get all products for the current seller"""
+    if current_user.role != "seller" and current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only sellers can view their products"
+        )
+    
+    pool = await get_pg_connection()
+    try:
+        async with pool.acquire() as conn:
+            products = await conn.fetch(
+                """
+                SELECT 
+                    p.*,
+                    COALESCE(
+                        json_agg(
+                            json_build_object(
+                                'image_id', pi.image_id,
+                                'image_url', pi.image_url,
+                                'uploaded_at', pi.uploaded_at
+                            )
+                        ) FILTER (WHERE pi.image_id IS NOT NULL),
+                        '[]'::json
+                    ) as images
+                FROM products p
+                LEFT JOIN product_images pi ON p.product_id = pi.product_id
+                WHERE p.seller_id = $1
+                GROUP BY p.product_id
+                ORDER BY p.created_at DESC
+                """,
+                current_user.user_id
+            )
+            
+            # Convert records to dictionaries and parse images
+            result = []
+            for product in products:
+                product_dict = dict(product)
+                if isinstance(product_dict['images'], str):
+                    import json
+                    product_dict['images'] = json.loads(product_dict['images'])
+                result.append(product_dict)
+            
+            return result
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -206,18 +213,105 @@ async def read_products(
         await pool.close()
 
 @router.get("/{product_id}", response_model=ProductOut)
-async def read_product(product_id: int):
+async def get_product(
+    product_id: int,
+    current_user: Optional[UserOut] = Depends(get_current_user)
+):
     """Get a specific product by ID"""
     pool = await get_pg_connection()
     try:
         async with pool.acquire() as conn:
-            product = await fetch_product_with_images(conn, product_id)
+            product = await conn.fetchrow(
+                """
+                SELECT 
+                    p.*,
+                    COALESCE(
+                        json_agg(
+                            json_build_object(
+                                'image_id', pi.image_id,
+                                'image_url', pi.image_url,
+                                'uploaded_at', pi.uploaded_at
+                            )
+                        ) FILTER (WHERE pi.image_id IS NOT NULL),
+                        '[]'::json
+                    ) as images
+                FROM products p
+                LEFT JOIN product_images pi ON p.product_id = pi.product_id
+                WHERE p.product_id = $1
+                GROUP BY p.product_id
+                """,
+                product_id
+            )
+            
             if not product:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Product not found"
                 )
-            return product
+            
+            # Convert record to dictionary and parse images
+            product_dict = dict(product)
+            if isinstance(product_dict['images'], str):
+                import json
+                product_dict['images'] = json.loads(product_dict['images'])
+            
+            return product_dict
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+    finally:
+        await pool.close()
+
+@router.delete("/{product_id}")
+async def delete_product(
+    product_id: int,
+    current_user: UserOut = Depends(get_current_user)
+):
+    """Delete a product (seller only)"""
+    pool = await get_pg_connection()
+    try:
+        async with pool.acquire() as conn:
+            # Check if product exists and belongs to seller
+            product = await conn.fetchrow(
+                "SELECT * FROM products WHERE product_id = $1",
+                product_id
+            )
+            if not product:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Product not found"
+                )
+            
+            # Only seller or admin can delete their products
+            if product["seller_id"] != current_user.user_id and current_user.role != "admin":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to delete this product"
+                )
+            
+            # Delete product images from Cloudinary first
+            images = await conn.fetch(
+                "SELECT image_url FROM product_images WHERE product_id = $1",
+                product_id
+            )
+            
+            for image in images:
+                try:
+                    # Extract public_id from Cloudinary URL
+                    public_id = image["image_url"].split("/")[-1].split(".")[0]
+                    cloudinary.uploader.destroy(public_id)
+                except Exception as e:
+                    print(f"Error deleting image from Cloudinary: {str(e)}")
+            
+            # Delete product (cascade will handle product_images)
+            await conn.execute(
+                "DELETE FROM products WHERE product_id = $1",
+                product_id
+            )
+            
+            return {"message": "Product deleted successfully"}
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -230,75 +324,115 @@ async def read_product(product_id: int):
 async def update_product(
     product_id: int,
     product_update: ProductUpdate,
-    current_user = Depends(require_role(["seller", "ADMIN"]))
+    current_user: UserOut = Depends(get_current_user)
 ):
-    """Update a product (Seller/Admin only)"""
+    """Update a product (seller only)"""
     pool = await get_pg_connection()
     try:
         async with pool.acquire() as conn:
-            async with conn.transaction():
-                # Check if product exists and user is authorized
-                existing_product = await conn.fetchrow(
-                    "SELECT seller_id FROM products WHERE product_id = $1",
-                    product_id
+            # Check if product exists and belongs to seller
+            product = await conn.fetchrow(
+                "SELECT * FROM products WHERE product_id = $1",
+                product_id
+            )
+            if not product:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Product not found"
                 )
-                if not existing_product:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail="Product not found"
-                    )
-
-                # Authorize: Seller can only update their own products
-                if current_user['role'] == 'seller' and existing_product['seller_id'] != current_user['user_id']:
-                     raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="You do not have permission to update this product"
-                    )
-
-                # Build update query dynamically
-                update_fields = []
-                update_values = []
-                param_index = 1
-
-                if product_update.name is not None:
-                    update_fields.append(f"name = ${param_index}")
-                    update_values.append(product_update.name)
-                    param_index += 1
-                if product_update.description is not None:
-                    update_fields.append(f"description = ${param_index}")
-                    update_values.append(product_update.description)
-                    param_index += 1
-                if product_update.price is not None:
-                    update_fields.append(f"price = ${param_index}")
-                    update_values.append(product_update.price)
-                    param_index += 1
-                if product_update.stock is not None:
-                    update_fields.append(f"stock = ${param_index}")
-                    update_values.append(product_update.stock)
-                    param_index += 1
-                if product_update.category is not None:
-                    update_fields.append(f"category = ${param_index}")
-                    update_values.append(product_update.category)
-                    param_index += 1
-
-                if not update_fields:
-                    return await fetch_product_with_images(conn, product_id) # Nothing to update
-
-                update_query = f"UPDATE products SET {', '.join(update_fields)} WHERE product_id = ${param_index} RETURNING *"
-                update_values.append(product_id)
-
-                updated_product = await conn.fetchrow(update_query, *update_values)
-
-                if not updated_product:
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="Failed to update product"
-                    )
-
-                product_out = await fetch_product_with_images(conn, updated_product['product_id'])
-                return product_out
-    except HTTPException:
-        raise
+            
+            # Only seller or admin can update their products
+            if product["seller_id"] != current_user.user_id and current_user.role != "admin":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to update this product"
+                )
+            
+            # Build update query dynamically based on provided fields
+            update_fields = []
+            values = []
+            param_count = 1
+            
+            if product_update.name is not None:
+                update_fields.append(f"name = ${param_count}")
+                values.append(product_update.name)
+                param_count += 1
+            
+            if product_update.description is not None:
+                update_fields.append(f"description = ${param_count}")
+                values.append(product_update.description)
+                param_count += 1
+            
+            if product_update.price is not None:
+                update_fields.append(f"price = ${param_count}")
+                values.append(product_update.price)
+                param_count += 1
+            
+            if product_update.stock is not None:
+                update_fields.append(f"stock = ${param_count}")
+                values.append(product_update.stock)
+                param_count += 1
+            
+            if product_update.category is not None:
+                update_fields.append(f"category = ${param_count}")
+                values.append(product_update.category)
+                param_count += 1
+            
+            if not update_fields:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No fields to update"
+                )
+            
+            # Add updated_at timestamp
+            update_fields.append("updated_at = CURRENT_TIMESTAMP")
+            
+            # Add product_id to values
+            values.append(product_id)
+            
+            # Execute update
+            query = f"""
+                UPDATE products 
+                SET {', '.join(update_fields)}
+                WHERE product_id = ${param_count}
+                RETURNING *
+            """
+            
+            updated_product = await conn.fetchrow(query, *values)
+            
+            # Fetch the updated product with its images
+            product_data = await conn.fetchrow(
+                """
+                SELECT 
+                    p.*,
+                    COALESCE(
+                        json_agg(
+                            json_build_object(
+                                'image_id', pi.image_id,
+                                'image_url', pi.image_url,
+                                'uploaded_at', pi.uploaded_at
+                            )
+                        ) FILTER (WHERE pi.image_id IS NOT NULL),
+                        '[]'::json
+                    ) as images
+                FROM products p
+                LEFT JOIN product_images pi ON p.product_id = pi.product_id
+                WHERE p.product_id = $1
+                GROUP BY p.product_id
+                """,
+                product_id
+            )
+            
+            # Convert the record to a dictionary
+            product_dict = dict(product_data)
+            
+            # Parse the images JSON string into a list
+            if isinstance(product_dict['images'], str):
+                import json
+                product_dict['images'] = json.loads(product_dict['images'])
+            
+            return product_dict
+            
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -307,7 +441,10 @@ async def update_product(
     finally:
         await pool.close()
 
-@router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
+class DeleteResponse(BaseModel):
+    message: str
+
+@router.delete("/{product_id}", response_model=DeleteResponse)
 async def delete_product(
     product_id: int,
     current_user = Depends(require_role(["seller", "admin"]))
@@ -347,7 +484,7 @@ async def delete_product(
                         detail="Failed to delete product"
                     )
 
-                return # No content on successful deletion
+                return DeleteResponse(message="Product deleted successfully")
     except HTTPException:
         raise
     except Exception as e:
@@ -358,50 +495,54 @@ async def delete_product(
     finally:
         await pool.close()
 
+class ProductStatusUpdate(BaseModel):
+    status: str
+
 @router.put("/{product_id}/status", response_model=ProductOut)
 async def update_product_status(
     product_id: int,
-    new_status: Literal['pending', 'approved', 'rejected'] = Query(..., description="New product status"),
-    current_user = Depends(require_role(["admin"]))
+    status_update: ProductStatusUpdate,
+    current_user: UserOut = Depends(get_current_user)
 ):
-    """Update product status (Admin only)"""
+    """Update product status (admin only)"""
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can update product status"
+        )
+    
+    # Validate status
+    if status_update.status not in ["pending", "approved", "rejected"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid status. Must be one of: pending, approved, rejected"
+        )
+    
     pool = await get_pg_connection()
     try:
         async with pool.acquire() as conn:
-            async with conn.transaction():
-                # Check if product exists
-                existing_product = await conn.fetchrow(
-                    "SELECT product_id FROM products WHERE product_id = $1",
-                    product_id
+            # Check if product exists
+            product = await conn.fetchrow(
+                "SELECT * FROM products WHERE product_id = $1",
+                product_id
+            )
+            if not product:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Product not found"
                 )
-                if not existing_product:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail="Product not found"
-                    )
-
-                # Update the product status
-                updated_product = await conn.fetchrow(
-                    """
-                    UPDATE products
-                    SET status = $1
-                    WHERE product_id = $2
-                    RETURNING product_id, seller_id, name, description, price, stock, category, rating, created_at, status
-                    """,
-                    new_status,
-                    product_id
-                )
-
-                if not updated_product:
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="Failed to update product status"
-                    )
-
-                product_out = await fetch_product_with_images(conn, updated_product['product_id'])
-                return product_out
-    except HTTPException:
-        raise
+            
+            # Update product status
+            updated_product = await conn.fetchrow(
+                """
+                UPDATE products 
+                SET status = $1, updated_at = CURRENT_TIMESTAMP
+                WHERE product_id = $2
+                RETURNING *
+                """,
+                status_update.status, product_id
+            )
+            return dict(updated_product)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -414,92 +555,167 @@ async def update_product_status(
 async def upload_product_image(
     product_id: int,
     file: UploadFile = File(...),
-    current_user = Depends(require_role(["seller", "ADMIN"]))
+    current_user: UserOut = Depends(get_current_user)
 ):
-    """Upload image for a product (Seller/Admin only)"""
+    """Upload an image for a product (seller only)"""
+    # Validate file type
+    if not file.content_type.startswith('image/'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File must be an image"
+        )
+    
     pool = await get_pg_connection()
     try:
         async with pool.acquire() as conn:
-            # Check if product exists and user is authorized
-            existing_product = await conn.fetchrow(
-                "SELECT seller_id FROM products WHERE product_id = $1",
+            # Check if product exists and belongs to seller
+            product = await conn.fetchrow(
+                "SELECT * FROM products WHERE product_id = $1",
                 product_id
             )
-            if not existing_product:
+            if not product:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Product not found"
                 )
-
-            # Authorize: Seller can only upload images for their own products
-            if current_user['role'] == 'seller' and existing_product['seller_id'] != current_user['user_id']:
-                 raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You do not have permission to upload images for this product"
-                )
-
-            # File validation
-            if not validate_filename(file.filename):
-                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid filename"
-                 )
-
-            # Read file content asynchronously
-            content = await file.read()
             
-            if len(content) > MAX_FILE_SIZE:
+            # Only seller or admin can upload images
+            if product["seller_id"] != current_user.user_id and current_user.role != "admin":
                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="File too large"
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to upload images for this product"
                 )
-
-            # Check file type using python-magic
-            file_type = magic.from_buffer(content, mime=True)
-            if file_type not in ALLOWED_IMAGE_TYPES:
-                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid file type"
-                 )
-
-            # Save file temporarily for Cloudinary upload
-            # Use tempfile for secure temporary file creation
-            fd, path = tempfile.mkstemp(suffix=ALLOWED_IMAGE_TYPES[file_type])
+            
+            # Upload image to Cloudinary
             try:
-                async with aiofiles.open(path, 'wb') as temp_file:
-                    await temp_file.write(content)
-                os.close(fd) # Close the file descriptor immediately after async write
-
-                # Upload to Cloudinary
-                upload_result = upload_image(path, folder="product_images") # Specify a folder
-                if 'secure_url' not in upload_result:
-                     raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="Failed to upload image to Cloudinary"
-                    )
+                # Read file content
+                contents = await file.read()
                 
-                image_url = upload_result['secure_url']
-
-                # Save image URL to database
+                # Upload to Cloudinary
+                upload_result = cloudinary.uploader.upload(
+                    contents,
+                    folder="product_images",
+                    resource_type="image"
+                )
+                
+                # Get the secure URL
+                image_url = upload_result.get("secure_url") or upload_result.get("url")
+                if not image_url:
+                    raise Exception("No image URL in upload result")
+                
+                # Add image URL to product_images table
                 await conn.execute(
-                    "INSERT INTO product_images (product_id, image_url) VALUES ($1, $2)",
+                    """
+                    INSERT INTO product_images (product_id, image_url)
+                    VALUES ($1, $2)
+                    """,
                     product_id, image_url
                 )
-
-                # Fetch the updated product with new image
-                product_out = await fetch_product_with_images(conn, product_id)
-                return product_out
-            finally:
-                # Clean up temporary file
-                if os.path.exists(path):
-                    os.remove(path)
-
-    except HTTPException:
-        raise # Re-raise HTTP exceptions
+                
+                # Fetch the updated product with its images
+                product_data = await conn.fetchrow(
+                    """
+                    SELECT 
+                        p.*,
+                        COALESCE(
+                            json_agg(
+                                json_build_object(
+                                    'image_id', pi.image_id,
+                                    'image_url', pi.image_url,
+                                    'uploaded_at', pi.uploaded_at
+                                )
+                            ) FILTER (WHERE pi.image_id IS NOT NULL),
+                            '[]'::json
+                        ) as images
+                    FROM products p
+                    LEFT JOIN product_images pi ON p.product_id = pi.product_id
+                    WHERE p.product_id = $1
+                    GROUP BY p.product_id
+                    """,
+                    product_id
+                )
+                
+                # Convert the record to a dictionary
+                product_dict = dict(product_data)
+                
+                # Parse the images JSON string into a list
+                if isinstance(product_dict['images'], str):
+                    import json
+                    product_dict['images'] = json.loads(product_dict['images'])
+                
+                return product_dict
+                
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"An error occurred during image upload: {str(e)}"
+                )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred during image upload: {str(e)}"
+            detail=str(e)
+        )
+    finally:
+        await pool.close()
+
+@router.delete("/{product_id}/images/{image_id}")
+async def delete_product_image(
+    product_id: int,
+    image_id: int,
+    current_user: UserOut = Depends(get_current_user)
+):
+    """Delete a product image (seller only)"""
+    pool = await get_pg_connection()
+    try:
+        async with pool.acquire() as conn:
+            # Check if product exists and belongs to seller
+            product = await conn.fetchrow(
+                "SELECT * FROM products WHERE product_id = $1",
+                product_id
+            )
+            if not product:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Product not found"
+                )
+            
+            # Only seller or admin can delete images
+            if product["seller_id"] != current_user.user_id and current_user.role != "admin":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to delete this image"
+                )
+            
+            # Get image URL before deleting
+            image = await conn.fetchrow(
+                "SELECT image_url FROM product_images WHERE image_id = $1 AND product_id = $2",
+                image_id, product_id
+            )
+            if not image:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Image not found"
+                )
+            
+            # Delete from Cloudinary
+            try:
+                # Extract public_id from Cloudinary URL
+                public_id = image["image_url"].split("/")[-1].split(".")[0]
+                cloudinary.uploader.destroy(public_id)
+            except Exception as e:
+                print(f"Error deleting image from Cloudinary: {str(e)}")
+            
+            # Delete from database
+            await conn.execute(
+                "DELETE FROM product_images WHERE image_id = $1 AND product_id = $2",
+                image_id, product_id
+            )
+            
+            return {"message": "Image deleted successfully"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
         )
     finally:
         await pool.close() 

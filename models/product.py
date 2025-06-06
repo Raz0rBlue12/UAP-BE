@@ -15,23 +15,22 @@ class ProductCreate(ProductBase):
 
 class ProductImage(BaseModel):
     image_id: int
-    product_id: int
     image_url: str
     uploaded_at: datetime
 
-    class Config:
-        from_attributes = True
-
-class ProductOut(ProductBase):
+class ProductOut(BaseModel):
     product_id: int
     seller_id: int
+    name: str
+    description: str
+    price: float
+    stock: int
+    category: str
     rating: float
+    status: str
     created_at: datetime
-    status: Literal['pending', 'approved', 'rejected']
-    images: List[ProductImage] = [] # List of associated images
-
-    class Config:
-        from_attributes = True
+    updated_at: Optional[datetime] = None
+    images: List[ProductImage] = []
 
 class ProductUpdate(ProductBase):
     name: Optional[str] = Field(None, min_length=1, max_length=150)

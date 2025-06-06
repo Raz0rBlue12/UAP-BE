@@ -13,6 +13,7 @@ from pydantic import BaseModel, EmailStr
 from db.client import supabase, get_pg_connection
 from services.email_service import send_reset_password_email
 from utils.rate_limiter import RateLimiter
+from jwt.exceptions import InvalidTokenError
 
 from models.user import UserCreate, UserOut, UserLogin, Token, TokenData
 
@@ -50,7 +51,7 @@ class Token(BaseModel):
     token_type: str
 
 class TokenData(BaseModel):
-    username: Optional[str] = None
+    email: Optional[str] = None
 
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
@@ -126,116 +127,174 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 #     login_attempts[email]["last_attempt"] = current_time
 #     return True
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> UserOut:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid authentication credentials",
+        detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    
-    # Check if token is blacklisted
-    if token in TOKEN_BLACKLIST:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has been invalidated",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
         if email is None:
             raise credentials_exception
-        
-        # Verify token hasn't expired
-        exp = payload.get("exp")
-        if exp is None or datetime.utcnow().timestamp() > exp:
-            raise credentials_exception
-            
         token_data = TokenData(email=email)
-    except jwt.InvalidTokenError:
+    except InvalidTokenError:
         raise credentials_exception
     
-    # Get user from database
-    conn = await get_pg_connection()
+    pool = await get_pg_connection()
     try:
-        user = await conn.fetchrow(
-            "SELECT * FROM users WHERE email = $1",
-            token_data.email
+        async with pool.acquire() as conn:
+            user = await conn.fetchrow(
+                "SELECT * FROM users WHERE email = $1",
+                token_data.email
+            )
+            if user is None:
+                raise credentials_exception
+            return UserOut(**dict(user))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
         )
-        if user is None:
-            raise credentials_exception
-        return user
     finally:
-        await conn.close()
+        await pool.close()
 
 @router.post("/register", response_model=UserOut)
-async def register(user: UserCreate, response: Response):
-    # Validate password strength
-    if not is_password_strong(user.password):
+async def register_user(user: UserCreate):
+    """Register a new user"""
+    # Prevent direct admin registration
+    if user.role == "admin":
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password must be at least 8 characters long and contain uppercase, lowercase, numbers, and special characters"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot register as admin directly"
         )
     
-    conn = await get_pg_connection()
+    pool = await get_pg_connection()
     try:
-        # Start transaction
-        async with conn.transaction():
-            # Check if user already exists
+        async with pool.acquire() as conn:
+            # Check if username or email already exists
             existing_user = await conn.fetchrow(
-                "SELECT * FROM users WHERE email = $1 OR username = $2",
-                user.email, user.username
+                "SELECT username, email FROM users WHERE username = $1 OR email = $2",
+                user.username, user.email
             )
             if existing_user:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Email or username already registered"
-                )
-            
+                if existing_user['username'] == user.username:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Username already registered"
+                    )
+                if existing_user['email'] == user.email:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Email already registered"
+                    )
+
             # Hash the password
-            hashed_password = get_password_hash(user.password)
-            
-            # Insert new user
+            hashed_password = pwd_context.hash(user.password)
+
+            # Create user
             new_user = await conn.fetchrow(
                 """
                 INSERT INTO users (username, email, password_hash, role)
                 VALUES ($1, $2, $3, $4)
-                RETURNING user_id, username, email, role, created_at
+                RETURNING user_id, username, email, role, created_at, is_active
                 """,
                 user.username, user.email, hashed_password, user.role
             )
-            
-            if not new_user:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to create user"
-                )
-            
-            # Convert asyncpg Record to dict
-            user_dict = dict(new_user)
-            
-            # Create UserOut model from dict
-            user_out = UserOut(**user_dict)
-            
-            # Set security headers
-            response.headers["X-Content-Type-Options"] = "nosniff"
-            response.headers["X-Frame-Options"] = "DENY"
-            response.headers["X-XSS-Protection"] = "1; mode=block"
-            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-            
-            return user_out
+
+            # Create user profile
+            await conn.execute(
+                """
+                INSERT INTO user_profiles (user_id)
+                VALUES ($1)
+                """,
+                new_user['user_id']
+            )
+
+            return dict(new_user)
     except HTTPException:
-        # Re-raise HTTP exceptions as they are already properly formatted
         raise
     except Exception as e:
-        # If any other error occurs, the transaction will be automatically rolled back
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An error occurred while registering the user"
+            detail=str(e)
         )
     finally:
-        await conn.close()
+        await pool.close()
+
+@router.post("/admin/register", response_model=UserOut)
+async def register_admin(
+    user: UserCreate,
+    current_user: UserOut = Depends(get_current_user)
+):
+    """Register a new admin user (admin only)"""
+    # Check if current user is admin
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can create admin accounts"
+        )
+    
+    # Ensure the new user is an admin
+    if user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This endpoint can only create admin accounts"
+        )
+    
+    pool = await get_pg_connection()
+    try:
+        async with pool.acquire() as conn:
+            # Check if username or email already exists
+            existing_user = await conn.fetchrow(
+                "SELECT username, email FROM users WHERE username = $1 OR email = $2",
+                user.username, user.email
+            )
+            if existing_user:
+                if existing_user['username'] == user.username:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Username already registered"
+                    )
+                if existing_user['email'] == user.email:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Email already registered"
+                    )
+
+            # Hash the password
+            hashed_password = pwd_context.hash(user.password)
+
+            # Create admin user
+            new_user = await conn.fetchrow(
+                """
+                INSERT INTO users (username, email, password_hash, role)
+                VALUES ($1, $2, $3, $4)
+                RETURNING user_id, username, email, role, created_at, is_active
+                """,
+                user.username, user.email, hashed_password, "admin"
+            )
+
+            # Create user profile
+            await conn.execute(
+                """
+                INSERT INTO user_profiles (user_id)
+                VALUES ($1)
+                """,
+                new_user['user_id']
+            )
+
+            return dict(new_user)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+    finally:
+        await pool.close()
 
 @router.post("/login", response_model=Token)
 async def login(
@@ -398,11 +457,12 @@ async def reset_password(request: ResetPasswordRequest):
         )
 
 def require_role(roles: List[str]):
-    async def role_checker(current_user = Depends(get_current_user)):
-        if current_user['role'] not in roles:
+    """Dependency to check if user has required role"""
+    async def role_checker(current_user: UserOut = Depends(get_current_user)):
+        if current_user.role not in roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to perform this action"
+                detail=f"Not authorized. Required roles: {', '.join(roles)}"
             )
         return current_user
     return role_checker
