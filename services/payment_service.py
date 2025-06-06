@@ -130,6 +130,7 @@ class PaymentService:
                 ) as response:
                     if response.status != 201:
                         error_data = await response.json()
+                        print(f"Midtrans API error response (Status: {response.status}): {error_data}")
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
                             detail=f"Payment gateway error: {error_data.get('message', 'Unknown error')}"

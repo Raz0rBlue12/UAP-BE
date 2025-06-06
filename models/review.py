@@ -3,12 +3,14 @@ from typing import Optional
 from datetime import datetime
 
 class ReviewBase(BaseModel):
-    rating: int = Field(..., ge=1, le=5, description="Rating of the product (1 to 5)")
-    comment: Optional[str] = Field(None, description="Optional comment for the review")
+    rating: int = Field(..., ge=1, le=5, description="Rating from 1 to 5")
+    comment: str = Field(..., description="Review comment")
 
 class ReviewCreate(ReviewBase):
     product_id: int = Field(..., description="ID of the product being reviewed")
-    # user_id and created_at will be set by the database
+
+class ReviewUpdate(ReviewBase):
+    pass
 
 class ReviewOut(ReviewBase):
     review_id: int

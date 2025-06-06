@@ -1,14 +1,19 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List
 from db.client import get_pg_connection
-from models.cart import CartItemCreate, CartItemOut, CartItemUpdate
+from models.cart import CartItemCreate, CartItemOut, CartItemUpdate, ProductImage
 from routers.auth import get_current_user
 from models.user import UserOut
+from pydantic import BaseModel
+from datetime import datetime
 
 router = APIRouter(
     prefix="/cart",
     tags=["Cart"]
 )
+
+class DeleteResponse(BaseModel):
+    message: str
 
 @router.post("/", response_model=CartItemOut, status_code=status.HTTP_201_CREATED)
 async def add_to_cart(
@@ -39,10 +44,29 @@ async def add_to_cart(
                      raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not enough stock available")
 
                 updated_item = await conn.fetchrow(
-                    "UPDATE shopping_cart SET quantity = $1 WHERE cart_id = $2 RETURNING cart_id, user_id, product_id, quantity",
+                    """
+                    UPDATE shopping_cart sc
+                    SET quantity = $1
+                    FROM products p
+                    WHERE sc.cart_id = $2 AND sc.product_id = p.product_id
+                    RETURNING 
+                        sc.cart_id, sc.user_id, sc.product_id, sc.quantity,
+                        p.name as product_name, p.description as product_description,
+                        p.price as product_price, p.stock as product_stock,
+                        p.category as product_category, p.rating as product_rating
+                    """,
                     new_quantity, existing_item['cart_id']
                 )
-                return CartItemOut(**dict(updated_item))
+                
+                # Get product images
+                images = await conn.fetch(
+                    "SELECT image_id, image_url, uploaded_at FROM product_images WHERE product_id = $1",
+                    updated_item['product_id']
+                )
+                
+                item_dict = dict(updated_item)
+                item_dict['product_images'] = [dict(img) for img in images]
+                return CartItemOut(**item_dict)
             else:
                 # Add new item to cart
                 # Check if initial quantity exceeds stock
@@ -50,10 +74,32 @@ async def add_to_cart(
                      raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not enough stock available")
                      
                 new_item = await conn.fetchrow(
-                    "INSERT INTO shopping_cart (user_id, product_id, quantity) VALUES ($1, $2, $3) RETURNING cart_id, user_id, product_id, quantity",
+                    """
+                    INSERT INTO shopping_cart (user_id, product_id, quantity)
+                    SELECT $1, $2, $3
+                    FROM products p
+                    WHERE p.product_id = $2
+                    RETURNING 
+                        cart_id, user_id, product_id, quantity,
+                        (SELECT name FROM products WHERE product_id = $2) as product_name,
+                        (SELECT description FROM products WHERE product_id = $2) as product_description,
+                        (SELECT price FROM products WHERE product_id = $2) as product_price,
+                        (SELECT stock FROM products WHERE product_id = $2) as product_stock,
+                        (SELECT category FROM products WHERE product_id = $2) as product_category,
+                        (SELECT rating FROM products WHERE product_id = $2) as product_rating
+                    """,
                     current_user.user_id, item.product_id, item.quantity
                 )
-                return CartItemOut(**dict(new_item))
+                
+                # Get product images
+                images = await conn.fetch(
+                    "SELECT image_id, image_url, uploaded_at FROM product_images WHERE product_id = $1",
+                    new_item['product_id']
+                )
+                
+                item_dict = dict(new_item)
+                item_dict['product_images'] = [dict(img) for img in images]
+                return CartItemOut(**item_dict)
     except HTTPException:
         raise # Re-raise HTTP exceptions
     except Exception as e:
@@ -65,15 +111,42 @@ async def add_to_cart(
 async def get_cart(
     current_user: UserOut = Depends(get_current_user)
 ):
-    """Get the user's shopping cart"""
+    """Get the user's shopping cart with product details"""
     pool = await get_pg_connection()
     try:
         async with pool.acquire() as conn:
             items = await conn.fetch(
-                "SELECT cart_id, user_id, product_id, quantity FROM shopping_cart WHERE user_id = $1",
+                """
+                SELECT 
+                    sc.cart_id,
+                    sc.user_id,
+                    sc.product_id,
+                    sc.quantity,
+                    p.name as product_name,
+                    p.description as product_description,
+                    p.price as product_price,
+                    p.stock as product_stock,
+                    p.category as product_category,
+                    p.rating as product_rating
+                FROM shopping_cart sc
+                JOIN products p ON sc.product_id = p.product_id
+                WHERE sc.user_id = $1
+                """,
                 current_user.user_id
             )
-            return [CartItemOut(**dict(item)) for item in items]
+            
+            # Get images for each product
+            result = []
+            for item in items:
+                item_dict = dict(item)
+                images = await conn.fetch(
+                    "SELECT image_id, image_url, uploaded_at FROM product_images WHERE product_id = $1",
+                    item['product_id']
+                )
+                item_dict['product_images'] = [dict(img) for img in images]
+                result.append(CartItemOut(**item_dict))
+            
+            return result
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     finally:
@@ -109,10 +182,29 @@ async def update_cart_item(
 
             # Update quantity
             updated_item = await conn.fetchrow(
-                "UPDATE shopping_cart SET quantity = $1 WHERE cart_id = $2 RETURNING cart_id, user_id, product_id, quantity",
+                """
+                UPDATE shopping_cart sc
+                SET quantity = $1
+                FROM products p
+                WHERE sc.cart_id = $2 AND sc.product_id = p.product_id
+                RETURNING 
+                    sc.cart_id, sc.user_id, sc.product_id, sc.quantity,
+                    p.name as product_name, p.description as product_description,
+                    p.price as product_price, p.stock as product_stock,
+                    p.category as product_category, p.rating as product_rating
+                """,
                 item_update.quantity, cart_item_id
             )
-            return CartItemOut(**dict(updated_item))
+            
+            # Get product images
+            images = await conn.fetch(
+                "SELECT image_id, image_url, uploaded_at FROM product_images WHERE product_id = $1",
+                updated_item['product_id']
+            )
+            
+            item_dict = dict(updated_item)
+            item_dict['product_images'] = [dict(img) for img in images]
+            return CartItemOut(**item_dict)
     except HTTPException:
         raise # Re-raise HTTP exceptions
     except Exception as e:
@@ -120,7 +212,7 @@ async def update_cart_item(
     finally:
         await pool.close()
 
-@router.delete("/{cart_item_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{cart_item_id}", response_model=DeleteResponse)
 async def remove_from_cart(
     cart_item_id: int,
     current_user: UserOut = Depends(get_current_user)
@@ -136,7 +228,7 @@ async def remove_from_cart(
             )
             if result != "DELETE 1":
                  raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cart item not found or does not belong to user")
-            return # No content on successful deletion
+            return DeleteResponse(message="Item successfully removed from cart")
     except HTTPException:
         raise # Re-raise HTTP exceptions
     except Exception as e:

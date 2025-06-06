@@ -1,13 +1,11 @@
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel
 from datetime import datetime
 
 class NotificationBase(BaseModel):
-    message: str = Field(..., description="Content of the notification")
+    message: str
 
 class NotificationCreate(NotificationBase):
-    user_id: int = Field(..., description="ID of the user the notification is for")
-    # is_read and created_at will be set by the database
+    pass
 
 class NotificationOut(NotificationBase):
     notification_id: int

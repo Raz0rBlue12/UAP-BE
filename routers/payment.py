@@ -37,7 +37,7 @@ async def create_payment(
     try:
         # Create transaction in Midtrans
         transaction = await payment_service.create_transaction(
-            user_id=current_user["user_id"],
+            user_id=current_user.user_id,
             amount=payment.amount,
             payment_method=payment.payment_method,
             customer_details=payment.customer_details,
@@ -55,7 +55,7 @@ async def create_payment(
                 VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
                 """,
                 transaction["order_id"],
-                current_user["user_id"],
+                current_user.user_id,
                 payment.amount,
                 payment.payment_method,
                 transaction["transaction_status"],
@@ -149,7 +149,7 @@ async def get_payment_status(
             WHERE order_id = $1 AND user_id = $2
             """,
             order_id,
-            current_user["user_id"]
+            current_user.user_id
         )
 
         if not transaction:
@@ -205,7 +205,7 @@ async def cancel_payment(
             WHERE order_id = $1 AND user_id = $2
             """,
             order_id,
-            current_user["user_id"]
+            current_user.user_id
         )
 
         if not transaction:
